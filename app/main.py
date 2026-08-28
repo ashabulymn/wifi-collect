@@ -7,12 +7,25 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="LJN NOC WiFi Collector", version="1.2.0")
+app = FastAPI(title="LJN NOC WiFi Collector", version="1.2.1")
 TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 ALLOW_PUBLIC = os.getenv("ALLOW_PUBLIC_IPS", "false").lower() == "true"
-CREDS = [(os.getenv(f"COLLECTOR_USERNAME_{i}"), os.getenv(f"COLLECTOR_PASSWORD_{i}")) for i in range(1, 4)]
-CREDS = [(u, p) for u, p in CREDS if u and p]
+
+def load_credentials():
+    creds = []
+    i = 1
+    while True:
+        u = os.getenv(f"COLLECTOR_USERNAME_{i}")
+        p = os.getenv(f"COLLECTOR_PASSWORD_{i}")
+        if u is None and p is None:
+            break
+        if u and p:
+            creds.append((u, p))
+        i += 1
+    return creds
+
+CREDS = load_credentials()
 results = []
 
 LABELS = {
@@ -20,7 +33,6 @@ LABELS = {
     "wifi_password": ["wpa pre-shared key", "wpa psk", "wpa passphrase", "wifi password", "wireless password", "pre-shared key", "passphrase"],
     "pppoe_username": ["pppoe username", "pppoe user", "pppoe account", "internet username", "wan username"],
 }
-
 
 def parse_values(soup, keywords):
     values, seen = [], set()
@@ -34,14 +46,7 @@ def parse_values(soup, keywords):
             value = str(value).strip()
             if value and value not in seen:
                 seen.add(value); values.append(value)
-    text = soup.get_text(" ", strip=True)
-    for k in keywords:
-        for m in re.finditer(re.escape(k) + r"\s*[:=]\s*([^|\n]{1,100})", text, re.I):
-            value = m.group(1).strip()
-            if value and value not in seen:
-                seen.add(value); values.append(value)
     return values
-
 
 def detect_model(soup, headers=""):
     text = (soup.get_text(" ", strip=True) + " " + headers).lower()
@@ -50,7 +55,6 @@ def detect_model(soup, headers=""):
             return name.upper()
     return "Generic Web"
 
-
 def allowed_ip(value):
     try:
         ip = ipaddress.ip_address(value)
@@ -58,10 +62,9 @@ def allowed_ip(value):
     except ValueError:
         return False
 
-
 def login_and_collect(ip, username, password, scheme):
     s = requests.Session()
-    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.2"})
+    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.2.1"})
     try:
         r = s.get(f"{scheme}://{ip}/", timeout=TIMEOUT, verify=False, allow_redirects=True)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -93,16 +96,9 @@ def login_and_collect(ip, username, password, scheme):
         pppoe = parse_values(ps, LABELS["pppoe_username"])
         if not any([ssids, wifi_passwords, pppoe]) and len(rr.text) < 2000:
             return None
-        return {
-            "login": f"{username}/***",
-            "model": detect_model(ps, str(rr.headers)),
-            "ssid": " | ".join(ssids),
-            "wifi_password": " | ".join(wifi_passwords),
-            "pppoe_username": " | ".join(pppoe),
-        }
+        return {"login": f"{username}/***", "model": detect_model(ps, str(rr.headers)), "ssid": " | ".join(ssids), "wifi_password": " | ".join(wifi_passwords), "pppoe_username": " | ".join(pppoe)}
     except requests.RequestException:
         return None
-
 
 def collect(ip):
     row = {"ip": ip, "status": "FAILED", "login": "", "model": "", "ssid": "", "wifi_password": "", "pppoe_username": "", "note": ""}
@@ -121,17 +117,14 @@ def collect(ip):
     row["note"] = "All configured credentials failed or data not exposed"
     return row
 
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "wifi-collector", "version": "1.2.0"}
-
+    return {"status": "ok", "service": "wifi-collector", "version": "1.2.1", "credentials_loaded": len(CREDS)}
 
 @app.get("/", response_class=HTMLResponse)
 def home():
     with open("templates/index.html", encoding="utf-8") as f:
         return f.read()
-
 
 @app.post("/collect")
 async def collect_ips(file: UploadFile = File(...)):
@@ -149,7 +142,6 @@ async def collect_ips(file: UploadFile = File(...)):
             results.append(f.result())
     results.sort(key=lambda x: x["ip"])
     return {"total": len(results), "success": sum(x["status"] == "OK" for x in results), "failed": sum(x["status"] != "OK" for x in results), "results": results}
-
 
 @app.get("/export.csv")
 def export_csv():
