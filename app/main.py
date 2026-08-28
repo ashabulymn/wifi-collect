@@ -7,23 +7,23 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="LJN NOC WiFi Collector")
+app = FastAPI(title="LJN NOC WiFi Collector", version="1.2.0")
 TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 ALLOW_PUBLIC = os.getenv("ALLOW_PUBLIC_IPS", "false").lower() == "true"
 CREDS = [(os.getenv(f"COLLECTOR_USERNAME_{i}"), os.getenv(f"COLLECTOR_PASSWORD_{i}")) for i in range(1, 4)]
 CREDS = [(u, p) for u, p in CREDS if u and p]
 results = []
+
 LABELS = {
     "ssid": ["ssid", "wifi name", "wireless name", "wlan ssid", "ssid name"],
     "wifi_password": ["wpa pre-shared key", "wpa psk", "wpa passphrase", "wifi password", "wireless password", "pre-shared key", "passphrase"],
     "pppoe_username": ["pppoe username", "pppoe user", "pppoe account", "internet username", "wan username"],
 }
 
-# Collect all matching values instead of returning only the first SSID/password.
+
 def parse_values(soup, keywords):
-    values = []
-    seen = set()
+    values, seen = [], set()
     for tag in soup.find_all(["input", "textarea", "select"]):
         hay = " ".join(str(tag.get(a, "")) for a in ["name", "id", "class", "placeholder", "title"]).lower()
         if any(k in hay for k in keywords):
@@ -42,6 +42,7 @@ def parse_values(soup, keywords):
                 seen.add(value); values.append(value)
     return values
 
+
 def detect_model(soup, headers=""):
     text = (soup.get_text(" ", strip=True) + " " + headers).lower()
     for name in ["zte", "huawei", "fiberhome", "tp-link", "mikrotik", "raisecom", "nokia", "d-link"]:
@@ -49,11 +50,20 @@ def detect_model(soup, headers=""):
             return name.upper()
     return "Generic Web"
 
+
+def allowed_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        return ALLOW_PUBLIC or ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return False
+
+
 def login_and_collect(ip, username, password, scheme):
     s = requests.Session()
-    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.1"})
+    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.2"})
     try:
-        r = s.get(f"{scheme}://{ip}/", timeout=TIMEOUT, verify=False)
+        r = s.get(f"{scheme}://{ip}/", timeout=TIMEOUT, verify=False, allow_redirects=True)
         soup = BeautifulSoup(r.text, "html.parser")
         forms = soup.find_all("form")
         if not forms:
@@ -93,6 +103,7 @@ def login_and_collect(ip, username, password, scheme):
     except requests.RequestException:
         return None
 
+
 def collect(ip):
     row = {"ip": ip, "status": "FAILED", "login": "", "model": "", "ssid": "", "wifi_password": "", "pppoe_username": "", "note": ""}
     if not allowed_ip(ip):
@@ -110,17 +121,17 @@ def collect(ip):
     row["note"] = "All configured credentials failed or data not exposed"
     return row
 
-def allowed_ip(value):
-    try:
-        ip = ipaddress.ip_address(value)
-        return ALLOW_PUBLIC or ip.is_private or ip.is_loopback or ip.is_link_local
-    except ValueError:
-        return False
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "wifi-collector", "version": "1.2.0"}
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
     with open("templates/index.html", encoding="utf-8") as f:
         return f.read()
+
 
 @app.post("/collect")
 async def collect_ips(file: UploadFile = File(...)):
@@ -138,6 +149,7 @@ async def collect_ips(file: UploadFile = File(...)):
             results.append(f.result())
     results.sort(key=lambda x: x["ip"])
     return {"total": len(results), "success": sum(x["status"] == "OK" for x in results), "failed": sum(x["status"] != "OK" for x in results), "results": results}
+
 
 @app.get("/export.csv")
 def export_csv():
