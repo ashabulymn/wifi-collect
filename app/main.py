@@ -20,24 +20,27 @@ LABELS = {
     "pppoe_username": ["pppoe username", "pppoe user", "pppoe account", "internet username", "wan username"],
 }
 
-def allowed_ip(value):
-    try:
-        ip = ipaddress.ip_address(value)
-        return ALLOW_PUBLIC or ip.is_private or ip.is_loopback or ip.is_link_local
-    except ValueError:
-        return False
-
-def parse_value(soup, keywords):
+# Collect all matching values instead of returning only the first SSID/password.
+def parse_values(soup, keywords):
+    values = []
+    seen = set()
     for tag in soup.find_all(["input", "textarea", "select"]):
         hay = " ".join(str(tag.get(a, "")) for a in ["name", "id", "class", "placeholder", "title"]).lower()
         if any(k in hay for k in keywords):
-            return tag.get("value", "")
+            value = tag.get("value", "")
+            if not value and tag.name == "select":
+                selected = tag.find("option", selected=True) or tag.find("option")
+                value = selected.get_text(" ", strip=True) if selected else ""
+            value = str(value).strip()
+            if value and value not in seen:
+                seen.add(value); values.append(value)
     text = soup.get_text(" ", strip=True)
     for k in keywords:
-        m = re.search(re.escape(k) + r"\s*[:=]\s*([^|\n]{1,100})", text, re.I)
-        if m:
-            return m.group(1).strip()
-    return ""
+        for m in re.finditer(re.escape(k) + r"\s*[:=]\s*([^|\n]{1,100})", text, re.I):
+            value = m.group(1).strip()
+            if value and value not in seen:
+                seen.add(value); values.append(value)
+    return values
 
 def detect_model(soup, headers=""):
     text = (soup.get_text(" ", strip=True) + " " + headers).lower()
@@ -48,7 +51,7 @@ def detect_model(soup, headers=""):
 
 def login_and_collect(ip, username, password, scheme):
     s = requests.Session()
-    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.0"})
+    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.1"})
     try:
         r = s.get(f"{scheme}://{ip}/", timeout=TIMEOUT, verify=False)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -75,12 +78,18 @@ def login_and_collect(ip, username, password, scheme):
         if rr.status_code >= 400 or any(x in body for x in ["incorrect password", "login failed", "invalid password", "wrong password"]):
             return None
         ps = BeautifulSoup(rr.text, "html.parser")
-        ssid = parse_value(ps, LABELS["ssid"])
-        wifi = parse_value(ps, LABELS["wifi_password"])
-        pppoe = parse_value(ps, LABELS["pppoe_username"])
-        if not any([ssid, wifi, pppoe]) and len(rr.text) < 2000:
+        ssids = parse_values(ps, LABELS["ssid"])
+        wifi_passwords = parse_values(ps, LABELS["wifi_password"])
+        pppoe = parse_values(ps, LABELS["pppoe_username"])
+        if not any([ssids, wifi_passwords, pppoe]) and len(rr.text) < 2000:
             return None
-        return {"login": f"{username}/***", "model": detect_model(ps, str(rr.headers)), "ssid": ssid, "wifi_password": wifi, "pppoe_username": pppoe}
+        return {
+            "login": f"{username}/***",
+            "model": detect_model(ps, str(rr.headers)),
+            "ssid": " | ".join(ssids),
+            "wifi_password": " | ".join(wifi_passwords),
+            "pppoe_username": " | ".join(pppoe),
+        }
     except requests.RequestException:
         return None
 
@@ -100,6 +109,13 @@ def collect(ip):
                 row.update(data); row["status"] = "OK"; return row
     row["note"] = "All configured credentials failed or data not exposed"
     return row
+
+def allowed_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        return ALLOW_PUBLIC or ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        return False
 
 @app.get("/", response_class=HTMLResponse)
 def home():
