@@ -1,0 +1,19 @@
+services:
+  wifi-collector:
+    build: .
+    container_name: wifi-collector
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - COLLECTOR_USERNAME_1=${COLLECTOR_USERNAME_1:-admin}
+      - COLLECTOR_PASSWORD_1=${COLLECTOR_PASSWORD_1:-admin}
+      - COLLECTOR_USERNAME_2=${COLLECTOR_USERNAME_2:-superadmin}
+      - COLLECTOR_PASSWORD_2=${COLLECTOR_PASSWORD_2:-suportadmin}
+      - COLLECTOR_USERNAME_3=${COLLECTOR_USERNAME_3:-user}
+      - COLLECTOR_PASSWORD_3=${COLLECTOR_PASSWORD_3:-user}
+      - MAX_WORKERS=${MAX_WORKERS:-8}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-8}
+      - ALLOW_PUBLIC_IPS=${ALLOW_PUBLIC_IPS:-false}
+    volumes:
+      - ./data:/app/data
