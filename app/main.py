@@ -7,10 +7,9 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-app = FastAPI(title="LJN NOC WiFi Collector", version="1.3.0")
+app = FastAPI(title="LJN NOC WiFi Collector", version="1.3.1")
 TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 WORKERS = int(os.getenv("MAX_WORKERS", "8"))
-ALLOW_PUBLIC = os.getenv("ALLOW_PUBLIC_IPS", "false").lower() == "true"
 results = []
 jobs = {}
 job_lock = threading.Lock()
@@ -38,11 +37,29 @@ LABELS = {
 }
 
 
-def log_event(job_id, ip, level, message):
-    entry = {"time": time.strftime("%H:%M:%S"), "ip": ip, "level": level, "message": message}
+def normalize_target(value):
+    """Accept an IPv4 address or CIDR host such as 10.5.58.212/32."""
+    value = str(value or "").strip()
+    if "/" in value:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+            if network.num_addresses == 1:
+                return str(network.network_address)
+            return None
+        except ValueError:
+            return None
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return None
+
+
+def log_event(job_id, ip, message, level="INFO"):
+    event = {"time": time.strftime("%H:%M:%S"), "ip": ip, "level": level, "message": message}
     with job_lock:
-        if job_id in jobs:
-            jobs[job_id]["logs"].append(entry)
+        job = jobs.get(job_id)
+        if job is not None:
+            job.setdefault("logs", []).append(event)
 
 
 def parse_values(soup, keywords):
@@ -56,7 +73,8 @@ def parse_values(soup, keywords):
                 value = selected.get_text(" ", strip=True) if selected else ""
             value = str(value).strip()
             if value and value not in seen:
-                seen.add(value); values.append(value)
+                seen.add(value)
+                values.append(value)
     return values
 
 
@@ -68,25 +86,17 @@ def detect_model(soup, headers=""):
     return "Generic Web"
 
 
-def allowed_ip(value):
-    try:
-        ip = ipaddress.ip_address(value)
-        return ALLOW_PUBLIC or ip.is_private or ip.is_loopback or ip.is_link_local
-    except ValueError:
-        return False
-
-
 def login_and_collect(ip, username, password, scheme, job_id, credential_no):
-    log_event(job_id, ip, "INFO", f"Trying credential #{credential_no} ({username}) via {scheme.upper()}")
     s = requests.Session()
-    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.3.0"})
+    s.headers.update({"User-Agent": "LJN-NOC-WifiCollector/1.3.1"})
     try:
-        log_event(job_id, ip, "INFO", f"Loading {scheme.upper()} login page")
+        log_event(job_id, ip, f"Loading {scheme.upper()} login page")
         r = s.get(f"{scheme}://{ip}/", timeout=TIMEOUT, verify=False, allow_redirects=True)
+        log_event(job_id, ip, f"Trying credential #{credential_no} ({username})")
         soup = BeautifulSoup(r.text, "html.parser")
         forms = soup.find_all("form")
         if not forms:
-            log_event(job_id, ip, "WARNING", "No login form detected")
+            log_event(job_id, ip, "Login form not detected", "WARNING")
             return None
         form = forms[0]
         action = urljoin(r.url, form.get("action") or r.url)
@@ -101,80 +111,79 @@ def login_and_collect(ip, username, password, scheme, job_id, credential_no):
         user_key = next((k for k in data if any(x in k.lower() for x in ["user", "login", "name"])), None)
         pass_key = next((k for k in data if any(x in k.lower() for x in ["pass", "pwd", "password"])), None)
         if not user_key or not pass_key:
-            log_event(job_id, ip, "WARNING", "Unable to identify username/password fields")
+            log_event(job_id, ip, "Username/password fields not detected", "WARNING")
             return None
         data[user_key], data[pass_key] = username, password
-        log_event(job_id, ip, "INFO", "Submitting login")
         rr = s.post(action, data=data, timeout=TIMEOUT, verify=False, allow_redirects=True)
         body = rr.text.lower()
         if rr.status_code >= 400 or any(x in body for x in ["incorrect password", "login failed", "invalid password", "wrong password"]):
-            log_event(job_id, ip, "WARNING", f"Login failed with credential #{credential_no}")
+            log_event(job_id, ip, f"Login failed with credential #{credential_no}", "WARNING")
             return None
+        log_event(job_id, ip, f"Login success with credential #{credential_no}", "SUCCESS")
         ps = BeautifulSoup(rr.text, "html.parser")
-        log_event(job_id, ip, "SUCCESS", "Login success")
+        log_event(job_id, ip, "Detecting modem model")
         model = detect_model(ps, str(rr.headers))
-        log_event(job_id, ip, f"INFO", f"Detected model: {model}")
-        log_event(job_id, ip, "INFO", "Checking SSID")
+        log_event(job_id, ip, f"Model detected: {model}")
+        log_event(job_id, ip, "Checking SSID")
         ssids = parse_values(ps, LABELS["ssid"])
-        if ssids:
-            log_event(job_id, ip, "SUCCESS", f"Found {len(ssids)} SSID(s)")
-        else:
-            log_event(job_id, ip, "WARNING", "SSID not found in returned page")
-        log_event(job_id, ip, "INFO", "Checking WiFi password")
+        for ssid in ssids:
+            log_event(job_id, ip, "SSID found")
+        log_event(job_id, ip, "Checking WiFi password")
         wifi_passwords = parse_values(ps, LABELS["wifi_password"])
         if wifi_passwords:
-            log_event(job_id, ip, "SUCCESS", f"Found {len(wifi_passwords)} WiFi password field(s)")
-        else:
-            log_event(job_id, ip, "WARNING", "WiFi password not found in returned page")
-        log_event(job_id, ip, "INFO", "Checking PPPoE username")
+            log_event(job_id, ip, "WiFi password found", "SUCCESS")
+        log_event(job_id, ip, "Checking WAN / PPPoE")
         pppoe = parse_values(ps, LABELS["pppoe_username"])
         if pppoe:
-            log_event(job_id, ip, "SUCCESS", "PPPoE username found")
-        else:
-            log_event(job_id, ip, "INFO", "PPPoE username not found in returned page")
+            log_event(job_id, ip, "PPPoE username found", "SUCCESS")
         if not any([ssids, wifi_passwords, pppoe]) and len(rr.text) < 2000:
-            log_event(job_id, ip, "WARNING", "Login response contains no collectible fields")
+            log_event(job_id, ip, "No collectible data exposed after login", "WARNING")
             return None
+        log_event(job_id, ip, "Collection completed", "SUCCESS")
         return {"login": f"{username}/***", "model": model, "ssid": " | ".join(ssids), "wifi_password": " | ".join(wifi_passwords), "pppoe_username": " | ".join(pppoe)}
     except requests.RequestException as exc:
-        log_event(job_id, ip, "WARNING", f"Connection error: {type(exc).__name__}")
+        log_event(job_id, ip, f"Request error: {type(exc).__name__}", "ERROR")
         return None
 
 
 def collect(ip, job_id):
     row = {"ip": ip, "status": "FAILED", "login": "", "model": "", "ssid": "", "wifi_password": "", "pppoe_username": "", "note": ""}
-    log_event(job_id, ip, "INFO", "Starting collection")
-    if not allowed_ip(ip):
-        row["note"] = "IP rejected by safety policy (private IPs only)"
-        log_event(job_id, ip, "ERROR", row["note"])
+    log_event(job_id, ip, "Starting")
+    target = normalize_target(ip)
+    if not target:
+        row["note"] = "Invalid IP/CIDR target"
+        log_event(job_id, ip, row["note"], "ERROR")
         return row
+    row["ip"] = target
     for scheme in ["http", "https"]:
-        log_event(job_id, ip, "INFO", f"Checking {scheme.upper()} connectivity")
+        log_event(job_id, target, f"Checking {scheme.upper()} connectivity")
         try:
-            r = requests.get(f"{scheme}://{ip}/", timeout=TIMEOUT, verify=False, allow_redirects=True)
-            log_event(job_id, ip, "SUCCESS", f"{scheme.upper()} reachable (HTTP {r.status_code})")
+            r = requests.get(f"{scheme}://{target}/", timeout=TIMEOUT, verify=False, allow_redirects=True)
+            log_event(job_id, target, f"{scheme.upper()} reachable (HTTP {r.status_code})", "SUCCESS")
         except requests.RequestException:
-            log_event(job_id, ip, "INFO", f"{scheme.upper()} unavailable")
+            log_event(job_id, target, f"{scheme.upper()} unavailable", "WARNING")
             continue
-        for idx, (u, p) in enumerate(CREDS, 1):
-            data = login_and_collect(ip, u, p, scheme, job_id, idx)
+        for n, (u, p) in enumerate(CREDS, 1):
+            data = login_and_collect(target, u, p, scheme, job_id, n)
             if data:
-                row.update(data); row["status"] = "OK"
-                log_event(job_id, ip, "SUCCESS", "Collection completed")
+                row.update(data)
+                row["status"] = "OK"
                 return row
     row["note"] = "All configured credentials failed or data not exposed"
-    log_event(job_id, ip, "ERROR", row["note"])
+    log_event(job_id, target, row["note"], "ERROR")
     return row
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "wifi-collector", "version": "1.3.0", "credentials_loaded": len(CREDS)}
+    return {"status": "ok", "service": "wifi-collector", "version": "1.3.1", "credentials_loaded": len(CREDS)}
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
     with open("templates/index.html", encoding="utf-8") as f:
         return f.read()
+
 
 @app.post("/collect")
 async def collect_ips(file: UploadFile = File(...)):
@@ -183,32 +192,41 @@ async def collect_ips(file: UploadFile = File(...)):
     ips = []
     for line in raw.splitlines():
         parts = line.strip().split()
-        if parts and parts[0] not in ips:
-            ips.append(parts[0])
+        if parts and normalize_target(parts[0]):
+            target = normalize_target(parts[0])
+            if target not in ips:
+                ips.append(target)
     job_id = uuid.uuid4().hex
     with job_lock:
-        jobs[job_id] = {"logs": [], "done": False, "total": len(ips)}
+        jobs[job_id] = {"status": "running", "logs": [], "results": []}
     results = []
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(collect, ip, job_id): ip for ip in ips}
         for f in as_completed(futures):
-            results.append(f.result())
+            row = f.result()
+            results.append(row)
+            with job_lock:
+                jobs[job_id]["results"] = list(results)
     results.sort(key=lambda x: x["ip"])
     with job_lock:
-        jobs[job_id]["done"] = True
+        jobs[job_id]["status"] = "completed"
     return {"job_id": job_id, "total": len(results), "success": sum(x["status"] == "OK" for x in results), "failed": sum(x["status"] != "OK" for x in results), "results": results}
 
-@app.get("/logs/{job_id}")
-def get_logs(job_id: str):
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
     with job_lock:
         job = jobs.get(job_id)
         if not job:
-            return {"logs": [], "done": True}
-        return {"logs": list(job["logs"]), "done": job["done"]}
+            return {"error": "job not found"}
+        return job
+
 
 @app.get("/export.csv")
 def export_csv():
     out = io.StringIO()
     fields = ["ip", "status", "login", "model", "ssid", "wifi_password", "pppoe_username", "note"]
-    w = csv.DictWriter(out, fieldnames=fields); w.writeheader(); w.writerows(results)
+    w = csv.DictWriter(out, fieldnames=fields)
+    w.writeheader()
+    w.writerows(results)
     return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=wifi-collector.csv"})
